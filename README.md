@@ -1,5 +1,5 @@
 [README.md](https://github.com/user-attachments/files/27275479/README.md)
-# Nedbank DE Challenge — Pipeline
+# Nedbank DE Challenge - Pipeline
 
 Medallion pipeline: accounts/customers/transactions → Bronze → Silver → Gold (Delta Parquet).
 
@@ -63,7 +63,7 @@ All three pass on Stage 1 data:
 
 **YAML-driven DQ rules** - all 6 rule codes, priorities, and currency variants live in `config/dq_rules.yaml`. Adding a new variant or rule requires no code changes.
 
-**Schema-drift tolerant** — unknown columns pass through silver. location/metadata struct flattening is column-existence guarded. merchant_subcategory absence (Stage 1) handled without breaking the schema.
+**Schema-drift tolerant** - unknown columns pass through silver. location/metadata struct flattening is column-existence guarded. merchant_subcategory absence (Stage 1) handled without breaking the schema.
 
 ## AI usage
 
