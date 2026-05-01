@@ -1,0 +1,144 @@
+import sys
+import logging
+from datetime import date
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DecimalType, LongType
+
+from pipeline.utils import load_config, build_spark, load_dq_rules
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+log = logging.getLogger(__name__)
+
+
+def _sk(col: F.Column) -> F.Column:
+    # Deterministic surrogate key: sha2 → first 15 hex chars → base10 BIGINT
+    # Same input always produces the same SK, safe to re-run
+    return F.conv(F.sha2(col.cast("string"), 256).substr(1, 15), 16, 10).cast(LongType())
+
+
+def _age_band(dob_col: str, run_date: date) -> F.Column:
+    run_lit = F.lit(run_date.isoformat()).cast("date")
+    age = F.floor(F.datediff(run_lit, F.col(dob_col)) / 365.25)
+    return (
+        F.when(age >= 65, F.lit("65+"))
+         .when(age >= 56, F.lit("56-65"))
+         .when(age >= 46, F.lit("46-55"))
+         .when(age >= 36, F.lit("36-45"))
+         .when(age >= 26, F.lit("26-35"))
+         .when(age >= 18, F.lit("18-25"))
+         .otherwise(F.lit(None).cast("string"))
+    )
+
+
+def _normalise_currency(col_name: str, variants: list) -> F.Column:
+    upper = [str(v).upper() for v in variants]
+    c = F.upper(F.trim(F.col(col_name).cast("string")))
+    return F.when(c.isin(upper), F.lit("ZAR")).otherwise(c)
+
+
+def _write(df, path, name):
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(path)
+    log.info("Wrote %s to %s", name, path)
+
+
+def _dim_customers(spark, silver, gold, run_date):
+    log.info("Building dim_customers")
+    df = spark.read.format("delta").load(silver + "/customers")
+    out = df.select(
+        _sk(F.col("customer_id")).alias("customer_sk"),
+        F.col("customer_id"),
+        F.col("gender"),
+        F.col("province"),
+        F.col("income_band"),
+        F.col("segment"),
+        F.col("risk_score").cast("integer").alias("risk_score"),
+        F.col("kyc_status"),
+        _age_band("dob", run_date).alias("age_band"),   # derived from dob, not copied raw
+    )
+    _write(out, gold + "/dim_customers", "dim_customers")
+
+
+def _dim_accounts(spark, silver, gold):
+    log.info("Building dim_accounts")
+    df = spark.read.format("delta").load(silver + "/accounts")
+    out = df.select(
+        _sk(F.col("account_id")).alias("account_sk"),
+        F.col("account_id"),
+        F.col("customer_ref").alias("customer_id"),      # GAP-026: renamed for query 2 join
+        F.col("account_type"),
+        F.col("account_status"),
+        F.col("open_date").cast("date").alias("open_date"),
+        F.col("product_tier"),
+        F.col("digital_channel"),
+        F.col("credit_limit").cast(DecimalType(18, 2)).alias("credit_limit"),
+        F.col("current_balance").cast(DecimalType(18, 2)).alias("current_balance"),
+        F.col("last_activity_date").cast("date").alias("last_activity_date"),
+    )
+    _write(out, gold + "/dim_accounts", "dim_accounts")
+
+
+def _fact_transactions(spark, silver, gold, zar_variants):
+    log.info("Building fact_transactions")
+    txn   = spark.read.format("delta").load(silver + "/transactions")
+    dacct = spark.read.format("delta").load(gold + "/dim_accounts")
+    dcust = spark.read.format("delta").load(gold + "/dim_customers")
+
+    # Broadcast both dims — avoids shuffling the 1M-row transactions table twice
+    acct_lu = F.broadcast(dacct.select(
+        F.col("account_id").alias("_aid"),
+        F.col("account_sk").alias("_ask"),
+        F.col("customer_id").alias("_cid"),
+    ))
+    cust_lu = F.broadcast(dcust.select(
+        F.col("customer_id").alias("_dcid"),
+        F.col("customer_sk").alias("_csk"),
+    ))
+
+    txn = txn.join(acct_lu, txn["account_id"] == F.col("_aid"), "left")
+    txn = txn.join(cust_lu, txn["_cid"] == F.col("_dcid"), "left")
+
+    out = txn.select(
+        _sk(F.col("transaction_id")).alias("transaction_sk"),
+        F.col("transaction_id"),
+        F.col("_ask").alias("account_sk"),
+        F.col("_csk").alias("customer_sk"),
+        F.col("transaction_date").cast("date").alias("transaction_date"),
+        F.col("transaction_timestamp").cast("timestamp").alias("transaction_timestamp"),
+        F.col("transaction_type"),
+        F.col("merchant_category"),
+        F.col("merchant_subcategory"),
+        F.col("amount").cast(DecimalType(18, 2)).alias("amount"),
+        _normalise_currency("currency", zar_variants).alias("currency"),
+        F.col("channel"),
+        F.col("province"),
+        F.col("dq_flag"),
+        F.col("ingestion_timestamp"),
+    )
+    _write(out, gold + "/fact_transactions", "fact_transactions")
+
+
+def run_provisioning(spark: SparkSession = None) -> SparkSession:
+    config   = load_config()
+    dq       = load_dq_rules(config)
+    if spark is None:
+        spark = build_spark(config)
+
+    silver = config["output"]["silver_path"]
+    gold   = config["output"]["gold_path"]
+    today  = date.today()
+    zar    = dq.get("currency_zar_variants", ["ZAR"])
+
+    # Dimensions first — fact reads their surrogate keys
+    _dim_customers(spark, silver, gold, today)
+    _dim_accounts(spark, silver, gold)
+    _fact_transactions(spark, silver, gold, zar)
+
+    log.info("Gold provisioning done")
+    return spark
+
+
+if __name__ == "__main__":
+    run_provisioning()
+    sys.exit(0)
