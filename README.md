@@ -43,25 +43,25 @@ Data must be mounted at `/data/input/` with `accounts.csv`, `customers.csv`, `tr
 
 All three pass on Stage 1 data:
 
-- **Q1** — 4 transaction types, 1,000,000 total records ✅
-- **Q2** — 0 unlinked accounts (zero tolerance) ✅
-- **Q3** — 9 SA provinces in dim_customers ✅
+- **Q1** - 4 transaction types, 1,000,000 total records 
+- **Q2** - 0 unlinked accounts (zero tolerance) 
+- **Q3** - 9 SA provinces in dim_customers 
 
 ## Design notes
 
-**No .count() calls** — all pre-write row counts removed. Each triggers a full dataset scan.
+**No .count() calls** - all pre-write row counts removed. Each triggers a full dataset scan.
 
-**SparkSession reused** — created once in ingest, passed through to silver and gold. Saves ~60s of JVM startup on a 30-minute time limit.
+**SparkSession reused** - created once in ingest, passed through to silver and gold. Saves ~60s of JVM startup on a 30-minute time limit.
 
-**Broadcast joins** — dim_accounts (~100k rows) and dim_customers (~80k rows) are both broadcast in fact_transactions. Also used for orphan detection in silver. Eliminates shuffle on the 1M-row transactions table.
+**Broadcast joins** - dim_accounts (~100k rows) and dim_customers (~80k rows) are both broadcast in fact_transactions. Also used for orphan detection in silver. Eliminates shuffle on the 1M-row transactions table.
 
-**Silver accounts cached** — written and cached, then passed directly into transactions for orphan detection. No second disk read, no timing risk.
+**Silver accounts cached** - written and cached, then passed directly into transactions for orphan detection. No second disk read, no timing risk.
 
-**Deterministic surrogate keys** — sha2(natural_key, 256) → first 15 hex chars → BIGINT. Same input always produces the same SK.
+**Deterministic surrogate keys** - sha2(natural_key, 256) → first 15 hex chars → BIGINT. Same input always produces the same SK.
 
-**Multi-format date parsing** — coalesce(ISO, DD/MM/YYYY, Unix epoch) in one Spark expression. No UDFs.
+**Multi-format date parsing** - coalesce(ISO, DD/MM/YYYY, Unix epoch) in one Spark expression. No UDFs.
 
-**YAML-driven DQ rules** — all 6 rule codes, priorities, and currency variants live in `config/dq_rules.yaml`. Adding a new variant or rule requires no code changes.
+**YAML-driven DQ rules** - all 6 rule codes, priorities, and currency variants live in `config/dq_rules.yaml`. Adding a new variant or rule requires no code changes.
 
 **Schema-drift tolerant** — unknown columns pass through silver. location/metadata struct flattening is column-existence guarded. merchant_subcategory absence (Stage 1) handled without breaking the schema.
 
