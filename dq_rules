@@ -1,0 +1,49 @@
+# DQ rules for the Silver transaction layer.
+# To disable a rule: set enabled: false
+# To add a currency variant: append to currency_zar_variants
+# No code changes needed for either.
+
+dq_rules:
+
+  - code: DUPLICATE_DEDUPED
+    enabled: true
+    action: flag
+    priority: 1
+    description: Duplicate transaction_id — earliest by timestamp is kept, rest flagged.
+
+  - code: ORPHANED_ACCOUNT
+    enabled: true
+    action: flag
+    priority: 2
+    description: transaction.account_id not found in silver accounts table.
+
+  - code: TYPE_MISMATCH
+    enabled: true
+    action: flag
+    priority: 3
+    description: amount field is not parseable as DECIMAL(18,2).
+
+  - code: DATE_FORMAT
+    enabled: true
+    action: flag
+    priority: 4
+    description: Date field could not be parsed by any of the three supported formats.
+
+  - code: CURRENCY_VARIANT
+    enabled: true
+    action: flag
+    priority: 5
+    description: currency is not ZAR after normalisation.
+
+  - code: NULL_REQUIRED
+    enabled: true
+    action: reject
+    priority: 6
+    description: Non-nullable field (transaction_id) is null — record dropped.
+
+currency_zar_variants:
+  - ZAR
+  - R
+  - RANDS
+  - "710"
+  - zar
