@@ -1,0 +1,20 @@
+# Pipeline configuration
+# Paths follow the Docker mount contract: /data/input, /data/config, /data/output
+
+input:
+  accounts_path:     /data/input/accounts.csv
+  customers_path:    /data/input/customers.csv
+  transactions_path: /data/input/transactions.jsonl
+
+output:
+  bronze_path:    /data/output/bronze
+  silver_path:    /data/output/silver
+  gold_path:      /data/output/gold
+  dq_report_path: /data/output/dq_report.json
+
+dq:
+  rules_path: /data/config/dq_rules.yaml
+
+spark:
+  master:   local[2]
+  app_name: nedbank-de-pipeline
