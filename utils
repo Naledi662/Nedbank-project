@@ -1,0 +1,54 @@
+import os
+import yaml
+import logging
+from pyspark.sql import SparkSession
+from delta import configure_spark_with_delta_pip
+
+log = logging.getLogger(__name__)
+
+
+def load_config() -> dict:
+    path = os.environ.get("PIPELINE_CONFIG", "/data/config/pipeline_config.yaml")
+    if not os.path.exists(path):
+        path = os.path.join(os.path.dirname(__file__), "..", "config", "pipeline_config.yaml")
+    log.info("Config: %s", path)
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def load_dq_rules(config: dict) -> dict:
+    path = config.get("dq", {}).get("rules_path", "/data/config/dq_rules.yaml")
+    if not os.path.exists(path):
+        path = os.path.join(os.path.dirname(__file__), "..", "config", "dq_rules.yaml")
+    log.info("DQ rules: %s", path)
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def build_spark(config: dict) -> SparkSession:
+    master = config.get("spark", {}).get("master", "local[2]")
+    app    = config.get("spark", {}).get("app_name", "nedbank-pipeline")
+
+    builder = (
+        SparkSession.builder
+        .appName(app)
+        .master(master)
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        # Memory: 1g driver gives ~550MB headroom inside the 2GB container ceiling
+        # 1500m was too close (98% utilisation) — OOM risk on Stage 2 3x volume
+        .config("spark.driver.memory", "1g")
+        # 4 shuffle partitions matches the 2-vCPU constraint (spec recommendation)
+        # Default 200 adds scheduling overhead with zero parallelism benefit at this scale
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.default.parallelism", "2")
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.autoBroadcastJoinThreshold", "10485760")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.files.maxPartitionBytes", "134217728")
+    )
+
+    spark = configure_spark_with_delta_pip(builder).getOrCreate()
+    spark.sparkContext.setLogLevel("WARN")
+    return spark
