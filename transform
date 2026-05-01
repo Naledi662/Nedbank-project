@@ -1,0 +1,163 @@
+import sys
+import logging
+
+from pyspark.sql import SparkSession, DataFrame, Window
+from pyspark.sql import functions as F
+from pyspark.sql.types import DecimalType, IntegerType
+
+from pipeline.utils import load_config, build_spark, load_dq_rules
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+log = logging.getLogger(__name__)
+
+
+def _parse_date(col_name: str) -> F.Column:
+    # Try ISO first, then DD/MM/YYYY, then Unix epoch (covers Stage 2 variants)
+    iso   = F.to_date(F.col(col_name), "yyyy-MM-dd")
+    dmy   = F.to_date(F.col(col_name), "dd/MM/yyyy")
+    epoch = F.to_date(F.from_unixtime(F.col(col_name).cast("long")), "yyyy-MM-dd")
+    return F.coalesce(iso, dmy, epoch)
+
+
+def _normalise_currency(col_name: str, variants: list) -> F.Column:
+    upper = [str(v).upper() for v in variants]
+    c = F.upper(F.trim(F.col(col_name).cast("string")))
+    return F.when(c.isin(upper), F.lit("ZAR")).otherwise(c)
+
+
+def _dedup(df: DataFrame, pk: str) -> DataFrame:
+    w = Window.partitionBy(pk).orderBy("ingestion_timestamp")
+    return df.withColumn("_rn", F.row_number().over(w)).filter(F.col("_rn") == 1).drop("_rn")
+
+
+def _write(df: DataFrame, path: str, name: str) -> None:
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(path)
+    log.info("Wrote %s to %s", name, path)
+
+
+def _accounts(spark, bronze, silver) -> DataFrame:
+    log.info("Silver: transforming accounts")
+    df = spark.read.format("delta").load(bronze + "/accounts")
+    df = (
+        df
+        .withColumn("open_date",          _parse_date("open_date"))
+        .withColumn("last_activity_date", _parse_date("last_activity_date"))
+        .withColumn("credit_limit",       F.col("credit_limit").cast(DecimalType(18, 2)))
+        .withColumn("current_balance",    F.col("current_balance").cast(DecimalType(18, 2)))
+    )
+    df = _dedup(df, "account_id")
+    df = df.filter(F.col("account_id").isNotNull())
+    df.cache()  # reused for orphan detection in transactions — avoids second disk read
+    _write(df, silver + "/accounts", "silver/accounts")
+    return df
+
+
+def _customers(spark, bronze, silver) -> None:
+    log.info("Silver: transforming customers")
+    df = spark.read.format("delta").load(bronze + "/customers")
+    df = (
+        df
+        .withColumn("dob",        _parse_date("dob"))
+        .withColumn("risk_score", F.col("risk_score").cast(IntegerType()))
+    )
+    df = _dedup(df, "customer_id")
+    df = df.filter(F.col("customer_id").isNotNull())
+    _write(df, silver + "/customers", "silver/customers")
+
+
+def _transactions(spark, bronze, silver, silver_accts: DataFrame, zar_variants, rules) -> None:
+    log.info("Silver: transforming transactions")
+    df = spark.read.format("delta").load(bronze + "/transactions")
+
+    # Drop corrupt JSON lines (from PERMISSIVE mode)
+    if "_corrupt_record" in df.columns:
+        df = df.filter(F.col("_corrupt_record").isNull()).drop("_corrupt_record")
+
+    # Flatten location struct
+    if "location" in df.columns:
+        df = (df.withColumn("province",    F.col("location.province"))
+                .withColumn("city",        F.col("location.city"))
+                .withColumn("coordinates", F.col("location.coordinates"))
+                .drop("location"))
+    else:
+        df = (df.withColumn("province",    F.lit(None).cast("string"))
+                .withColumn("city",        F.lit(None).cast("string"))
+                .withColumn("coordinates", F.lit(None).cast("string")))
+
+    # Flatten metadata struct
+    if "metadata" in df.columns:
+        df = (df.withColumn("device_id",  F.col("metadata.device_id"))
+                .withColumn("session_id", F.col("metadata.session_id"))
+                .withColumn("retry_flag", F.col("metadata.retry_flag").cast("boolean"))
+                .drop("metadata"))
+    else:
+        df = (df.withColumn("device_id",  F.lit(None).cast("string"))
+                .withColumn("session_id", F.lit(None).cast("string"))
+                .withColumn("retry_flag", F.lit(False).cast("boolean")))
+
+    # merchant_subcategory not present in Stage 1 source (field doesn't exist, not null)
+    if "merchant_subcategory" not in df.columns:
+        df = df.withColumn("merchant_subcategory", F.lit(None).cast("string"))
+
+    df = df.withColumn("currency", _normalise_currency("currency", zar_variants))
+    df = df.withColumn("amount",   F.col("amount").cast(DecimalType(18, 2)))
+    df = df.withColumn("transaction_date", _parse_date("transaction_date"))
+    df = df.withColumn(
+        "transaction_timestamp",
+        F.to_timestamp(
+            F.concat_ws(" ", F.col("transaction_date").cast("string"), F.col("transaction_time")),
+            "yyyy-MM-dd HH:mm:ss",
+        ),
+    )
+
+    # Rank duplicates before dedup so the flag gets set on the extras
+    dup_w = Window.partitionBy("transaction_id").orderBy("transaction_timestamp")
+    df = df.withColumn("_dup_rn", F.row_number().over(dup_w))
+
+    # Orphan detection — broadcast the small accounts set so we don't shuffle 1M rows
+    valid = F.broadcast(silver_accts.select(F.col("account_id").alias("_va")).distinct())
+    df = df.join(valid, df["account_id"] == F.col("_va"), "left")
+
+    # Build dq_flag expression from YAML rules (priority order, highest wins)
+    conditions = {
+        "DUPLICATE_DEDUPED": lambda: F.col("_dup_rn") > 1,
+        "ORPHANED_ACCOUNT":  lambda: F.col("_va").isNull(),
+        "TYPE_MISMATCH":     lambda: F.col("amount").isNull(),
+        "DATE_FORMAT":       lambda: F.col("transaction_date").isNull(),
+        "CURRENCY_VARIANT":  lambda: F.col("currency") != "ZAR",
+        "NULL_REQUIRED":     lambda: F.col("transaction_id").isNull(),
+    }
+    expr = F.lit(None).cast("string")
+    for rule in sorted(rules, key=lambda r: r["priority"], reverse=True):
+        if rule.get("enabled", True) and rule["code"] in conditions:
+            expr = F.when(conditions[rule["code"]](), F.lit(rule["code"])).otherwise(expr)
+    df = df.withColumn("dq_flag", expr)
+
+    df = df.filter(F.col("_dup_rn") == 1).drop("_dup_rn", "_va")
+    df = df.filter(F.col("transaction_id").isNotNull())
+    _write(df, silver + "/transactions", "silver/transactions")
+
+
+def run_transformation(spark: SparkSession = None) -> SparkSession:
+    config   = load_config()
+    dq       = load_dq_rules(config)
+    if spark is None:
+        spark = build_spark(config)
+
+    bronze = config["output"]["bronze_path"]
+    silver = config["output"]["silver_path"]
+    zar    = [str(v).upper() for v in dq.get("currency_zar_variants", ["ZAR"])]
+    rules  = dq.get("dq_rules", [])
+
+    silver_accts = _accounts(spark, bronze, silver)
+    _customers(spark, bronze, silver)
+    _transactions(spark, bronze, silver, silver_accts, zar, rules)
+    silver_accts.unpersist()
+
+    log.info("Silver transformation done")
+    return spark
+
+
+if __name__ == "__main__":
+    run_transformation()
+    sys.exit(0)
