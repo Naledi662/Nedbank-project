@@ -1,0 +1,67 @@
+import sys
+import logging
+from datetime import datetime, timezone
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+from pipeline.utils import load_config, build_spark
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+log = logging.getLogger(__name__)
+
+
+def _write(df, path, name):
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(path)
+    log.info("Wrote %s to %s", name, path)
+
+
+def run_ingestion(spark: SparkSession = None) -> SparkSession:
+    config = load_config()
+    if spark is None:
+        spark = build_spark(config)
+
+    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    inp = config["input"]
+    out = config["output"]["bronze_path"]
+
+    log.info("Bronze: ingesting accounts")
+    df = (
+        spark.read.format("csv")
+        .option("header", "true")
+        .option("inferSchema", "false")  # keep everything as strings in bronze
+        .option("encoding", "UTF-8")
+        .load(inp["accounts_path"])
+        .withColumn("ingestion_timestamp", F.lit(ts).cast("timestamp"))
+    )
+    _write(df, out + "/accounts", "accounts")
+
+    log.info("Bronze: ingesting customers")
+    df = (
+        spark.read.format("csv")
+        .option("header", "true")
+        .option("inferSchema", "false")
+        .option("encoding", "UTF-8")
+        .load(inp["customers_path"])
+        .withColumn("ingestion_timestamp", F.lit(ts).cast("timestamp"))
+    )
+    _write(df, out + "/customers", "customers")
+
+    log.info("Bronze: ingesting transactions")
+    df = (
+        spark.read.format("json")
+        .option("multiLine", "false")
+        .option("encoding", "UTF-8")
+        .option("mode", "PERMISSIVE")  # bad lines go to _corrupt_record, not exception
+        .load(inp["transactions_path"])
+        .withColumn("ingestion_timestamp", F.lit(ts).cast("timestamp"))
+    )
+    _write(df, out + "/transactions", "transactions")
+
+    log.info("Bronze ingestion done")
+    return spark
+
+
+if __name__ == "__main__":
+    run_ingestion()
+    sys.exit(0)
